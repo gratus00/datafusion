@@ -18,8 +18,8 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, ByteView, GenericStringArray, OffsetSizeTrait,
-    PrimitiveArray, StringArrayType, StringViewArray, make_view, new_null_array,
+    Array, ArrayRef, AsArray, ByteView, OffsetSizeTrait, PrimitiveArray, StringArrayType,
+    StringViewArray, make_view, new_null_array,
 };
 use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::{DataType, Int64Type};
@@ -27,6 +27,7 @@ use arrow_buffer::NullBuffer;
 
 use crate::strings::GenericStringArrayBuilder;
 use crate::utils::make_scalar_function;
+use datafusion_common::utils::offset_span_len;
 use datafusion_common::{
     Result, ScalarValue, exec_datafusion_err, exec_err, utils::take_function_args,
 };
@@ -153,7 +154,7 @@ fn substr_index(args: &[ArrayRef]) -> Result<ArrayRef> {
                 count_array,
                 GenericStringArrayBuilder::<i32>::with_capacity(
                     string_array.len(),
-                    visible_string_bytes(string_array),
+                    offset_span_len(string_array.offsets()),
                 ),
             )
         }
@@ -167,7 +168,7 @@ fn substr_index(args: &[ArrayRef]) -> Result<ArrayRef> {
                 count_array,
                 GenericStringArrayBuilder::<i64>::with_capacity(
                     string_array.len(),
-                    visible_string_bytes(string_array),
+                    offset_span_len(string_array.offsets()),
                 ),
             )
         }
@@ -231,7 +232,7 @@ fn substr_index_scalar(
                 count,
                 GenericStringArrayBuilder::<i32>::with_capacity(
                     arr.len(),
-                    visible_string_bytes(arr),
+                    offset_span_len(arr.offsets()),
                 ),
             )
         }
@@ -243,7 +244,7 @@ fn substr_index_scalar(
                 count,
                 GenericStringArrayBuilder::<i64>::with_capacity(
                     arr.len(),
-                    visible_string_bytes(arr),
+                    offset_span_len(arr.offsets()),
                 ),
             )
         }
@@ -251,14 +252,6 @@ fn substr_index_scalar(
     }?;
 
     Ok(ColumnarValue::Array(result))
-}
-
-#[inline]
-fn visible_string_bytes<T: OffsetSizeTrait>(
-    string_array: &GenericStringArray<T>,
-) -> usize {
-    let offsets = string_array.value_offsets();
-    offsets[offsets.len() - 1].as_usize() - offsets[0].as_usize()
 }
 
 fn substr_index_general<'a, S, O>(
@@ -281,7 +274,7 @@ where
 
     for i in 0..num_rows {
         if nulls.as_ref().is_some_and(|n| n.is_null(i)) {
-            builder.append_placeholder();
+            builder.try_append_placeholder()?;
             continue;
         }
         // SAFETY: `i < num_rows` and the union of input nulls is valid at i,
@@ -289,7 +282,7 @@ where
         let string = unsafe { string_array.value_unchecked(i) };
         let delimiter = unsafe { delimiter_array.value_unchecked(i) };
         let n = unsafe { count_array.value_unchecked(i) };
-        builder.append_value(substr_index_slice(string, delimiter, n));
+        builder.try_append_value(substr_index_slice(string, delimiter, n))?;
     }
 
     Ok(Arc::new(builder.finish(nulls)?) as ArrayRef)
@@ -323,9 +316,9 @@ fn substr_index_view(
     }
 
     let data_buffers = if has_out_of_line {
-        string_array.data_buffers().to_vec()
+        Arc::clone(string_array.data_buffers())
     } else {
-        vec![]
+        Arc::from([])
     };
 
     // Safety: each appended view is either:
@@ -455,9 +448,9 @@ fn substr_index_scalar_view(
     }
 
     let data_buffers = if has_out_of_line {
-        string_array.data_buffers().to_vec()
+        Arc::clone(string_array.data_buffers())
     } else {
-        vec![]
+        Arc::from([])
     };
 
     // Safety: each appended view is either:
@@ -487,13 +480,13 @@ where
     let nulls = string_array.nulls().cloned();
     for i in 0..string_array.len() {
         if nulls.as_ref().is_some_and(|n| n.is_null(i)) {
-            builder.append_placeholder();
+            builder.try_append_placeholder()?;
             continue;
         }
         // SAFETY: `i < string_array.len()` and `nulls` is valid at i, so the
         // input is also valid at i.
         let s = unsafe { string_array.value_unchecked(i) };
-        builder.append_value(f(s));
+        builder.try_append_value(f(s))?;
     }
     Ok(Arc::new(builder.finish(nulls)?) as ArrayRef)
 }
@@ -793,6 +786,27 @@ mod tests {
         assert_eq!(result.value(0), "alpha");
         assert_eq!(result.value(1), "short");
         assert!(result.is_null(2));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_substr_index_all_nulls() -> Result<()> {
+        use super::substr_index_general;
+        use crate::strings::GenericStringArrayBuilder;
+
+        let strings = StringArray::from(vec![None::<&str>, None]);
+        let delimiters = StringArray::from(vec![None::<&str>, Some(".")]);
+        let counts = Int64Array::from(vec![None, None]);
+
+        let result = substr_index_general(
+            &strings,
+            &delimiters,
+            &counts,
+            GenericStringArrayBuilder::<i32>::with_capacity(strings.len(), 0),
+        )?;
+        let result = result.as_string::<i32>();
+        assert_eq!(result, &StringArray::from(vec![None::<&str>, None]));
 
         Ok(())
     }

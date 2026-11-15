@@ -18,17 +18,17 @@
 //! [`ScalarUDFImpl`] definitions for array_scale function.
 
 use crate::utils::make_scalar_function;
-use arrow::array::{
-    Array, ArrayRef, Float64Array, GenericListArray, OffsetBufferBuilder, OffsetSizeTrait,
-};
-use arrow::buffer::NullBuffer;
+use arrow::array::{Array, ArrayRef, Float64Array, GenericListArray, OffsetSizeTrait};
+use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow::datatypes::{
     DataType,
     DataType::{FixedSizeList, LargeList, List, Null},
     Field,
 };
 use datafusion_common::cast::{as_float64_array, as_generic_list_array};
-use datafusion_common::utils::{ListCoercion, coerced_type_with_base_type_only};
+use datafusion_common::utils::{
+    ListCoercion, coerced_type_with_base_type_only, offset_span_len,
+};
 use datafusion_common::{Result, internal_err, plan_err, utils::take_function_args};
 use datafusion_expr::{
     ColumnarValue, Documentation, ScalarFunctionArgs, ScalarUDFImpl, Signature,
@@ -51,11 +51,11 @@ make_udf_expr_and_func!(
     syntax_example = "array_scale(array, scalar)",
     sql_example = r#"```sql
 > select array_scale([1.0, 2.0, 3.0], 2.0);
-+----------------------------------+
++-----------------------------------------------+
 | array_scale(List([1.0,2.0,3.0]),Float64(2.0)) |
-+----------------------------------+
-| [2.0, 4.0, 6.0]                  |
-+----------------------------------+
++-----------------------------------------------+
+| [2.0, 4.0, 6.0]                               |
++-----------------------------------------------+
 ```"#,
     argument(
         name = "array",
@@ -163,7 +163,7 @@ fn general_array_scale<O: OffsetSizeTrait>(
     let scalar_array = as_float64_array(scalar)?;
 
     let values = as_float64_array(list_array.values())?;
-    let offsets = list_array.value_offsets();
+    let offsets = list_array.offsets();
 
     // A row is null whenever either input row is null. The scalar applies
     // uniformly across the array, so a null scalar makes the whole row
@@ -171,12 +171,13 @@ fn general_array_scale<O: OffsetSizeTrait>(
     // rather than tracking row nulls inside the value loop.
     let row_nulls = NullBuffer::union(list_array.nulls(), scalar_array.nulls());
 
-    let mut value_builder = Float64Array::builder(values.len());
-    let mut new_offsets = OffsetBufferBuilder::<O>::new(list_array.len());
+    let mut value_builder = Float64Array::builder(offset_span_len(offsets));
+    let mut new_offsets = Vec::<O>::with_capacity(list_array.len() + 1);
+    new_offsets.push(O::zero());
 
     for row in 0..list_array.len() {
         if row_nulls.as_ref().is_some_and(|nb| nb.is_null(row)) {
-            new_offsets.push_length(0);
+            new_offsets.push(new_offsets[row]);
             continue;
         }
 
@@ -196,7 +197,7 @@ fn general_array_scale<O: OffsetSizeTrait>(
             }
         }
 
-        new_offsets.push_length(len);
+        new_offsets.push(new_offsets[row] + O::usize_as(len));
     }
 
     let values_array = Arc::new(value_builder.finish());
@@ -213,8 +214,23 @@ fn general_array_scale<O: OffsetSizeTrait>(
 
     Ok(Arc::new(GenericListArray::<O>::try_new(
         field,
-        new_offsets.finish(),
+        OffsetBuffer::new(new_offsets.into()),
         values_array,
         row_nulls,
     )?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sliced_capacity() -> Result<()> {
+        crate::utils::tests::check_sliced_list_behavior(|input| {
+            array_scale_inner(&[
+                Arc::clone(input),
+                Arc::new(Float64Array::from(vec![2.0; input.len()])),
+            ])
+        })
+    }
 }

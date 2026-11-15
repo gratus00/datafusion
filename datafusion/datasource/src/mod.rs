@@ -41,6 +41,10 @@ pub mod file_stream;
 pub mod memory;
 pub mod morsel;
 pub mod projection;
+/// Protobuf conversions for [`FileRange`], [`PartitionedFile`] and
+/// [`FileGroup`](crate::file_groups::FileGroup), gated on the `proto` feature.
+#[cfg(feature = "proto")]
+mod proto;
 pub mod schema_adapter;
 pub mod sink;
 pub mod source;
@@ -55,22 +59,19 @@ pub mod write;
 pub use self::file::as_file_source;
 pub use self::url::ListingTableUrl;
 use crate::file_groups::FileGroup;
+use arrow::datatypes::SchemaRef;
 use chrono::TimeZone;
-use datafusion_common::stats::Precision;
+use datafusion_common::stats::{Precision, is_known_empty};
 use datafusion_common::{ColumnStatistics, Result, TableReference};
 use datafusion_common::{ScalarValue, Statistics};
 use datafusion_physical_expr::LexOrdering;
 use futures::Stream;
 use object_store::{ObjectMeta, path::Path};
-pub use table_schema::{TableSchema, TableSchemaBuilder};
-// Remove when add_row_stats is remove
-use arrow::datatypes::SchemaRef;
-#[expect(deprecated)]
-pub use statistics::add_row_stats;
 pub use statistics::compute_all_files_statistics;
 use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
+pub use table_schema::{TableSchema, TableSchemaBuilder};
 
 /// User-defined per-file extension data, keyed by concrete Rust type.
 ///
@@ -503,7 +504,12 @@ pub fn generate_test_files(num_files: usize, overlap_factor: f64) -> Vec<FileGro
 /// Used by tests and benchmarks
 pub fn verify_sort_integrity(file_groups: &[FileGroup]) -> bool {
     for group in file_groups {
-        let files = group.iter().collect::<Vec<_>>();
+        // Known-empty files contribute no rows and may not have min/max
+        // statistics, so they cannot violate the ordering.
+        let files = group
+            .iter()
+            .filter(|file| !file.statistics.as_deref().is_some_and(is_known_empty))
+            .collect::<Vec<_>>();
         for i in 1..files.len() {
             let prev_file = files[i - 1];
             let curr_file = files[i];
